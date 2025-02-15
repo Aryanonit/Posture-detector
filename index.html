@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sitting Posture Detection</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.4.0/p5.js"></script>
+    <script src="https://unpkg.com/ml5@0.12.2/dist/ml5.min.js"></script>
+    <style>
+        body {
+            text-align: center;
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f0f0f0;
+        }
+        #videoContainer {
+            margin: 20px auto;
+            position: relative;
+            width: fit-content;
+        }
+        #status {
+            padding: 10px;
+            margin: 10px 0;
+            background-color: #fff;
+            border-radius: 5px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .feedback-message {
+            position: absolute;
+            bottom: 20px;
+            left: 0;
+            right: 0;
+            padding: 15px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            font-size: 20px;
+            z-index: 100;
+        }
+        .alert-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(255, 0, 0, 0.3);
+            display: none;
+            z-index: 99;
+        }
+    </style>
+</head>
+<body>
+    <h1>Sitting Posture Detection</h1>
+    <p id="status">Starting camera...</p>
+    <div id="videoContainer">
+        <div class="feedback-message" id="feedbackMessage"></div>
+        <div class="alert-overlay" id="alertOverlay"></div>
+    </div>
+
+    <script>
+        let video;
+        let poseNet;
+        let poses = [];
+        let canvas;
+        let lastCheckTime = 0;
+        let alertActive = false;
+        let badPostureStartTime = null;
+        let alertTimeout;
+
+        // Constants for posture checking
+        const POSTURE_CHECK_INTERVAL = 1000; // Check every second
+        const POOR_POSTURE_THRESHOLD = 2000; // Show alert after 2 seconds of poor posture
+        const ALERT_DURATION = 3000; // Alert shows for 3 seconds
+
+        window.addEventListener('load', async function() {
+            try {
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    throw new Error('Your browser does not support camera access');
+                }
+                await navigator.mediaDevices.getUserMedia({ video: true });
+                new p5(sketch);
+            } catch (err) {
+                document.getElementById('status').innerHTML = `
+                    <span class="error">
+                        Camera access error: ${err.message}<br>
+                        Please make sure you've allowed camera access.
+                    </span>
+                `;
+            }
+        });
+
+        const sketch = (p) => {
+            p.setup = async () => {
+                try {
+                    canvas = p.createCanvas(640, 480);
+                    canvas.parent('videoContainer');
+                    
+                    const constraints = {
+                        video: {
+                            width: { ideal: 640 },
+                            height: { ideal: 480 },
+                            facingMode: "user"
+                        }
+                    };
+
+                    video = p.createVideo('', onVideoLoad);
+                    video.elt.srcObject = await navigator.mediaDevices.getUserMedia(constraints);
+                    video.elt.play();
+                    video.hide();
+
+                } catch (err) {
+                    console.error('Setup error:', err);
+                    document.getElementById('status').innerHTML = `
+                        <span class="error">Setup error: ${err.message}</span>
+                    `;
+                }
+            };
+
+            p.draw = () => {
+                if (!video || !video.elt.videoWidth) return;
+
+                // Mirror the video
+                p.push();
+                p.translate(p.width, 0);
+                p.scale(-1, 1);
+                p.image(video, 0, 0, p.width, p.height);
+                p.pop();
+
+                // Draw pose detection elements
+                if (poses.length > 0) {
+                    drawPoseElements();
+                    checkPosture();
+                }
+            };
+
+            function drawPoseElements() {
+                const pose = poses[0].pose;
+                
+                // Draw connecting lines first
+                p.stroke(0, 255, 0);
+                p.strokeWeight(2);
+                drawConnectingLines(pose);
+
+                // Draw keypoints
+                p.noStroke();
+                for (let keypoint of pose.keypoints) {
+                    if (keypoint.score > 0.2) {
+                        p.fill(0, 255, 0);
+                        p.ellipse(p.width - keypoint.position.x, keypoint.position.y, 10, 10);
+                    }
+                }
+            }
+
+            function drawConnectingLines(pose) {
+                // Function to get keypoint position
+                const getPoint = (name) => {
+                    const point = pose.keypoints.find(k => k.part === name);
+                    return point?.score > 0.2 ? point.position : null;
+                };
+
+                // Get key points
+                const nose = getPoint('nose');
+                const leftShoulder = getPoint('leftShoulder');
+                const rightShoulder = getPoint('rightShoulder');
+                const leftEar = getPoint('leftEar');
+                const rightEar = getPoint('rightEar');
+
+                // Draw shoulder line
+                if (leftShoulder && rightShoulder) {
+                    p.line(
+                        p.width - leftShoulder.x, leftShoulder.y,
+                        p.width - rightShoulder.x, rightShoulder.y
+                    );
+                }
+
+                // Draw neck line (from nose to middle of shoulders)
+                if (nose && leftShoulder && rightShoulder) {
+                    const neckX = (leftShoulder.x + rightShoulder.x) / 2;
+                    const neckY = (leftShoulder.y + rightShoulder.y) / 2;
+                    p.line(
+                        p.width - neckX, neckY,
+                        p.width - nose.x, nose.y
+                    );
+                }
+
+                // Draw ear lines
+                if (nose && leftEar) {
+                    p.line(
+                        p.width - nose.x, nose.y,
+                        p.width - leftEar.x, leftEar.y
+                    );
+                }
+                if (nose && rightEar) {
+                    p.line(
+                        p.width - nose.x, nose.y,
+                        p.width - rightEar.x, rightEar.y
+                    );
+                }
+            }
+        };
+
+        function checkPosture() {
+            if (poses.length > 0 && Date.now() - lastCheckTime > POSTURE_CHECK_INTERVAL) {
+                lastCheckTime = Date.now();
+                const pose = poses[0].pose;
+                
+                const issues = analyzePosture(pose);
+                updateFeedback(issues);
+
+                // Handle poor posture timing and alerts
+                if (issues.length > 0) {
+                    if (!badPostureStartTime) {
+                        badPostureStartTime = Date.now();
+                    } else if (Date.now() - badPostureStartTime > POOR_POSTURE_THRESHOLD) {
+                        showAlert();
+                    }
+                } else {
+                    badPostureStartTime = null;
+                    hideAlert();
+                }
+            }
+        }
+
+        function analyzePosture(pose) {
+            const issues = [];
+            
+            // Get key points
+            const nose = pose.keypoints.find(k => k.part === 'nose');
+            const leftShoulder = pose.keypoints.find(k => k.part === 'leftShoulder');
+            const rightShoulder = pose.keypoints.find(k => k.part === 'rightShoulder');
+
+            if (nose && leftShoulder && rightShoulder) {
+                // Check head forward position
+                const shoulderMidX = (leftShoulder.position.x + rightShoulder.position.x) / 2;
+                if (Math.abs(nose.position.x - shoulderMidX) > 50) {
+                    issues.push("Head forward");
+                }
+
+                // Check shoulder alignment
+                const shoulderDiff = Math.abs(leftShoulder.position.y - rightShoulder.position.y);
+                if (shoulderDiff > 30) {
+                    issues.push("Shoulders uneven");
+                }
+            }
+
+            return issues;
+        }
+
+        function updateFeedback(issues) {
+            const feedbackEl = document.getElementById('feedbackMessage');
+            if (issues.length > 0) {
+                feedbackEl.textContent = "⚠️ " + issues.join(" & ") + " - Please adjust!";
+            } else {
+                feedbackEl.textContent = "✅ Good Posture!";
+            }
+        }
+
+        function showAlert() {
+            const overlay = document.getElementById('alertOverlay');
+            overlay.style.display = 'block';
+            
+            // Clear existing timeout if any
+            if (alertTimeout) {
+                clearTimeout(alertTimeout);
+            }
+            
+            // Set new timeout to hide alert
+            alertTimeout = setTimeout(() => {
+                hideAlert();
+            }, ALERT_DURATION);
+        }
+
+        function hideAlert() {
+            const overlay = document.getElementById('alertOverlay');
+            overlay.style.display = 'none';
+        }
+
+        function onVideoLoad() {
+            document.getElementById('status').innerText = 'Camera ready! Starting PoseNet...';
+            
+            const options = {
+                architecture: 'MobileNetV1',
+                imageScaleFactor: 0.5,
+                outputStride: 16,
+                flipHorizontal: true,
+                minConfidence: 0.3,
+                maxPoseDetections: 1,
+                scoreThreshold: 0.3,
+                nmsRadius: 20,
+                detectionType: 'single',
+                inputResolution: 513,
+                multiplier: 0.75
+            };
+
+            poseNet = ml5.poseNet(video, options, () => {
+                document.getElementById('status').innerText = 'Ready! Analyzing your posture...';
+            });
+
+            poseNet.on('pose', function(results) {
+                poses = results;
+            });
+        }
+    </script>
+</body>
+</html>
